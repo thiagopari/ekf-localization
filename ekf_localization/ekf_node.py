@@ -21,6 +21,7 @@ from rclpy.time import Time
 from sensor_msgs.msg import Imu
 from nav_msgs.msg import Odometry
 from geometry_msgs.msg import PoseStamped, TransformStamped
+from nav_msgs.msg import Path
 from tf2_ros import TransformBroadcaster
 import tf_transformations
 
@@ -123,6 +124,22 @@ class EKFNode(Node):
         
         # Publishers
         self.pose_pub = self.create_publisher(PoseStamped, 'ekf_pose', 10)
+        self.ekf_path_pub = self.create_publisher(Path, 'ekf_path', 10)
+        self.odom_path_pub = self.create_publisher(Path, 'odom_path', 10)
+        
+        # Path storage
+        self.ekf_path = Path()
+        self.ekf_path.header.frame_id = 'odom'
+        self.odom_path = Path()
+        self.odom_path.header.frame_id = 'odom'
+        self.dr_path = Path()  # Dead reckoning path (noisy velocities, no GPS)
+        self.dr_path.header.frame_id = 'odom'
+        
+        # Dead reckoning state (integrates noisy velocities without correction)
+        self.dr_state = np.zeros(3)  # [x, y, theta]
+        
+        # Publisher for dead reckoning path
+        self.dr_path_pub = self.create_publisher(Path, 'dr_path', 10)
         
         # Store latest odom for TF broadcasting
         self.latest_odom_pose = None
@@ -156,15 +173,26 @@ class EKFNode(Node):
         
         # Add noise to simulate realistic wheel odometry
         if self.add_odom_noise:
-            v += np.random.normal(0, self.odom_noise_std)
-            omega += np.random.normal(0, self.odom_noise_std * 0.5)
+            v_noisy = v + np.random.normal(0, self.odom_noise_std)
+            omega_noisy = omega + np.random.normal(0, self.odom_noise_std * 0.5)
+        else:
+            v_noisy = v
+            omega_noisy = omega
         
         # Compute dt
         if self.last_odom_time is not None:
             dt = current_time - self.last_odom_time
             
-            # Prediction step
-            self.ekf.predict(v, omega, dt)
+            # Prediction step (EKF uses noisy velocities)
+            self.ekf.predict(v_noisy, omega_noisy, dt)
+            
+            # Update dead reckoning state (same noisy velocities, no corrections)
+            if dt > 0 and dt < 1.0:
+                theta = self.dr_state[2]
+                theta_mid = theta + omega_noisy * dt / 2
+                self.dr_state[0] += v_noisy * dt * np.cos(theta_mid)
+                self.dr_state[1] += v_noisy * dt * np.sin(theta_mid)
+                self.dr_state[2] += omega_noisy * dt
         
         self.last_odom_time = current_time
         
@@ -187,11 +215,36 @@ class EKFNode(Node):
         
         # Publish current estimate
         self.publish_estimate(msg.header.stamp)
+        
+        # Publish dead reckoning path
+        self.publish_dr_path(msg.header.stamp)
     
     def imu_callback(self, msg: Imu):
         """Handle IMU messages - heading update step."""
         yaw = self.get_yaw_from_quaternion(msg.orientation)
         self.ekf.update_imu(yaw)
+    
+    def publish_dr_path(self, stamp):
+        """Publish dead reckoning path (noisy velocities, no corrections)."""
+        dr_pose = PoseStamped()
+        dr_pose.header.stamp = stamp
+        dr_pose.header.frame_id = 'odom'
+        dr_pose.pose.position.x = self.dr_state[0]
+        dr_pose.pose.position.y = self.dr_state[1]
+        dr_pose.pose.position.z = 0.0
+        
+        q = tf_transformations.quaternion_from_euler(0, 0, self.dr_state[2])
+        dr_pose.pose.orientation.x = q[0]
+        dr_pose.pose.orientation.y = q[1]
+        dr_pose.pose.orientation.z = q[2]
+        dr_pose.pose.orientation.w = q[3]
+        
+        self.dr_path.poses.append(dr_pose)
+        if len(self.dr_path.poses) > 1000:
+            self.dr_path.poses = self.dr_path.poses[-1000:]
+        
+        self.dr_path.header.stamp = stamp
+        self.dr_path_pub.publish(self.dr_path)
     
     def broadcast_odom_tf(self, msg: Odometry):
         """Broadcast odom -> base_footprint transform (missing from Gazebo)."""
@@ -206,6 +259,20 @@ class EKFNode(Node):
         t.transform.rotation = msg.pose.pose.orientation
         
         self.tf_broadcaster.sendTransform(t)
+        
+        # Store odometry path
+        odom_pose = PoseStamped()
+        odom_pose.header = msg.header
+        odom_pose.pose = msg.pose.pose
+        self.odom_path.poses.append(odom_pose)
+        
+        # Limit path length to avoid memory issues
+        if len(self.odom_path.poses) > 1000:
+            self.odom_path.poses = self.odom_path.poses[-1000:]
+        
+        # Publish odometry path
+        self.odom_path.header.stamp = msg.header.stamp
+        self.odom_path_pub.publish(self.odom_path)
     
     def publish_estimate(self, stamp):
         """Publish filtered pose estimate and TF."""
@@ -227,6 +294,13 @@ class EKFNode(Node):
         pose_msg.pose.orientation.w = q[3]
         
         self.pose_pub.publish(pose_msg)
+        
+        # Add to EKF path and publish
+        self.ekf_path.poses.append(pose_msg)
+        if len(self.ekf_path.poses) > 1000:
+            self.ekf_path.poses = self.ekf_path.poses[-1000:]
+        self.ekf_path.header.stamp = stamp
+        self.ekf_path_pub.publish(self.ekf_path)
         
         # Broadcast TF
         t = TransformStamped()
