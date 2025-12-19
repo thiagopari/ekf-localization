@@ -22,7 +22,7 @@ import numpy as np
 import rclpy
 from rclpy.node import Node
 from rclpy.time import Time
-from sensor_msgs.msg import Imu
+from sensor_msgs.msg import Imu, LaserScan
 from nav_msgs.msg import Odometry, Path
 from geometry_msgs.msg import PoseStamped, TransformStamped
 from visualization_msgs.msg import Marker
@@ -31,6 +31,7 @@ from tf2_ros import TransformBroadcaster
 import tf_transformations
 
 from ekf_localization.ukf import UKFLocalization
+from ekf_localization.scan_matcher import ScanMatcher
 
 
 class EKFLocalization:
@@ -115,6 +116,8 @@ class EKFNode(Node):
         self.declare_parameter('gps_outage_start', 30.0)  # seconds after start
         self.declare_parameter('gps_outage_duration', 15.0)  # seconds of outage
         self.declare_parameter('enable_gps_outage', False)  # toggle outage simulation
+        self.declare_parameter('enable_scan_matching', True)  # toggle LiDAR scan matching
+        self.declare_parameter('scan_match_min_interval', 0.1)  # minimum time between scan matches
         
         # Get parameters
         self.gps_rate = self.get_parameter('gps_rate').value
@@ -123,10 +126,23 @@ class EKFNode(Node):
         self.gps_outage_start = self.get_parameter('gps_outage_start').value
         self.gps_outage_duration = self.get_parameter('gps_outage_duration').value
         self.enable_gps_outage = self.get_parameter('enable_gps_outage').value
+        self.enable_scan_matching = self.get_parameter('enable_scan_matching').value
+        self.scan_match_min_interval = self.get_parameter('scan_match_min_interval').value
         
         # Initialize EKF and UKF
         self.ekf = EKFLocalization()
         self.ukf = UKFLocalization()
+        
+        # Initialize scan matcher
+        self.scan_matcher = ScanMatcher(
+            max_iterations=50,
+            convergence_threshold=1e-6,
+            max_correspondence_dist=0.5,
+            trim_ratio=0.8,
+            min_points=50
+        )
+        self.last_scan_time = None
+        self.scan_match_pose = np.zeros(3)  # Accumulated pose from scan matching
         
         # Timing
         self.last_odom_time = None
@@ -145,6 +161,7 @@ class EKFNode(Node):
         self.ukf_path_pub = self.create_publisher(Path, 'ukf_path', 10)
         self.odom_path_pub = self.create_publisher(Path, 'odom_path', 10)
         self.dr_path_pub = self.create_publisher(Path, 'dr_path', 10)
+        self.scan_path_pub = self.create_publisher(Path, 'scan_path', 10)
         self.cov_marker_pub = self.create_publisher(Marker, 'ekf_covariance', 10)
         
         # Path storage
@@ -156,6 +173,8 @@ class EKFNode(Node):
         self.odom_path.header.frame_id = 'odom'
         self.dr_path = Path()
         self.dr_path.header.frame_id = 'odom'
+        self.scan_path = Path()
+        self.scan_path.header.frame_id = 'odom'
         
         # Dead reckoning state (integrates noisy velocities without correction)
         self.dr_state = np.zeros(3)
@@ -164,7 +183,10 @@ class EKFNode(Node):
         self.ekf_errors = []
         self.ukf_errors = []
         self.dr_errors = []
+        self.scan_errors = []  # Scan matching only errors
         self.ground_truth_pos = np.zeros(2)
+        self.scan_match_count = 0
+        self.scan_match_success_count = 0
         self.metrics_pub = self.create_publisher(Float64MultiArray, 'ekf_metrics', 10)
         self.metrics_timer = self.create_timer(1.0, self.publish_metrics)  # Publish every 1 sec
         
@@ -173,12 +195,15 @@ class EKFNode(Node):
             Odometry, 'odom', self.odom_callback, 10)
         self.imu_sub = self.create_subscription(
             Imu, 'imu', self.imu_callback, 10)
+        self.scan_sub = self.create_subscription(
+            LaserScan, 'scan', self.scan_callback, 10)
         
         self.get_logger().info('EKF Localization Node started')
         self.get_logger().info(f'  GPS rate: {self.gps_rate} Hz')
         self.get_logger().info(f'  Odom noise injection: {self.add_odom_noise}')
         if self.enable_gps_outage:
             self.get_logger().info(f'  GPS outage enabled: starts at {self.gps_outage_start}s, duration {self.gps_outage_duration}s')
+        self.get_logger().info(f'  Scan matching: {"enabled" if self.enable_scan_matching else "disabled"}')
     
     def get_yaw_from_quaternion(self, q):
         """Extract yaw from quaternion."""
@@ -269,6 +294,131 @@ class EKFNode(Node):
         yaw = self.get_yaw_from_quaternion(msg.orientation)
         self.ekf.update_imu(yaw)
         self.ukf.update_imu(yaw)
+    
+    def scan_callback(self, msg: LaserScan):
+        """Handle LaserScan messages - scan matching update."""
+        if not self.enable_scan_matching:
+            return
+        
+        current_time = Time.from_msg(msg.header.stamp).nanoseconds / 1e9
+        
+        # Rate limiting
+        if self.last_scan_time is not None:
+            dt = current_time - self.last_scan_time
+            if dt < self.scan_match_min_interval:
+                return
+        else:
+            dt = 0.1  # Default dt for first scan
+        
+        # Convert scan to points
+        points = self.scan_matcher.laserscan_to_points(
+            np.array(msg.ranges),
+            msg.angle_min,
+            msg.angle_max,
+            msg.range_min,
+            msg.range_max
+        )
+        
+        if len(points) < 50:
+            return
+        
+        # Perform scan matching
+        delta_pose, rmse, fitness, num_corr, success = self.scan_matcher.match(points)
+        self.scan_match_count += 1
+        
+        if success:
+            self.scan_match_success_count += 1
+            
+            # Validate the match
+            is_valid, reason = self.scan_matcher.validate_match(
+                delta_pose, fitness, rmse, num_corr, dt
+            )
+            
+            if is_valid:
+                # ===== ADD DEBUG LOGGING HERE =====
+                self.get_logger().info(
+                    f"VALID match: delta=[{delta_pose[0]:.3f}, {delta_pose[1]:.3f}, {delta_pose[2]:.3f}], "
+                    f"fitness={fitness:.2f}, rmse={rmse:.4f}, corr={num_corr}"
+                )
+                # ===== END DEBUG LOGGING =====
+                
+                # Update scan-only pose accumulator
+                c, s = np.cos(self.scan_match_pose[2]), np.sin(self.scan_match_pose[2])
+                self.scan_match_pose[0] += c * delta_pose[0] - s * delta_pose[1]
+                self.scan_match_pose[1] += s * delta_pose[0] + c * delta_pose[1]
+                self.scan_match_pose[2] += delta_pose[2]
+                
+                # ===== ADD DEBUG LOGGING HERE =====
+                self.get_logger().info(
+                    f"Accumulated scan_pose: [{self.scan_match_pose[0]:.3f}, {self.scan_match_pose[1]:.3f}, {self.scan_match_pose[2]:.3f}]"
+                )
+                # ===== END DEBUG LOGGING =====
+                
+                # Estimate covariance
+                R_scan = self.scan_matcher.estimate_covariance(fitness, rmse, num_corr)
+                
+                # Create measurement: current EKF state + delta from scan matching
+                ekf_state = self.ekf.get_state()
+                scan_measurement = np.array([
+                    ekf_state[0] + (c * delta_pose[0] - s * delta_pose[1]),
+                    ekf_state[1] + (s * delta_pose[0] + c * delta_pose[1])
+                ])
+                
+                # Update EKF and UKF with scan matching (as position measurement)
+                self.update_with_scan_match(scan_measurement, R_scan[:2, :2])
+                
+                # Publish scan path
+                self.publish_scan_path(msg.header.stamp)
+            else:
+                # ===== ADD DEBUG LOGGING HERE =====
+                self.get_logger().warn(f"REJECTED match: {reason}, delta={delta_pose}, fitness={fitness:.2f}")
+                # ===== END DEBUG LOGGING =====
+        
+        self.last_scan_time = current_time
+    
+    def update_with_scan_match(self, z_pos: np.ndarray, R: np.ndarray):
+        """Update EKF and UKF with scan matching position measurement."""
+        # Temporarily modify GPS measurement noise for scan matching
+        original_R_gps = self.ekf.R_gps.copy()
+        self.ekf.R_gps = R
+        self.ukf.R_gps = R
+        
+        # Apply GPS-style update with scan matching measurement
+        self.ekf.update_gps(z_pos)
+        self.ukf.update_gps(z_pos)
+        
+        # Restore original GPS noise
+        self.ekf.R_gps = original_R_gps
+        self.ukf.R_gps = original_R_gps
+    
+    def publish_scan_path(self, stamp):
+        """Publish scan matching accumulated path."""
+        scan_pose = PoseStamped()
+        scan_pose.header.stamp = stamp
+        scan_pose.header.frame_id = 'odom'
+        scan_pose.pose.position.x = self.scan_match_pose[0]
+        scan_pose.pose.position.y = self.scan_match_pose[1]
+        scan_pose.pose.position.z = 0.0
+        
+        q = tf_transformations.quaternion_from_euler(0, 0, self.scan_match_pose[2])
+        scan_pose.pose.orientation.x = q[0]
+        scan_pose.pose.orientation.y = q[1]
+        scan_pose.pose.orientation.z = q[2]
+        scan_pose.pose.orientation.w = q[3]
+        
+        self.scan_path.poses.append(scan_pose)
+        if len(self.scan_path.poses) > 1000:
+            self.scan_path.poses = self.scan_path.poses[-1000:]
+        
+        self.scan_path.header.stamp = stamp
+        self.scan_path_pub.publish(self.scan_path)
+        
+        # Track scan-only error
+        scan_pos = np.array([self.scan_match_pose[0], self.scan_match_pose[1]])
+        scan_error = np.linalg.norm(scan_pos - self.ground_truth_pos)
+        self.scan_errors.append(scan_error)
+        if len(self.scan_errors) > 5000:
+            self.scan_errors = self.scan_errors[-5000:]
     
     def broadcast_odom_tf(self, msg: Odometry):
         """Broadcast odom -> base_footprint transform (missing from Gazebo)."""
@@ -498,17 +648,28 @@ class EKFNode(Node):
         ekf_improvement = (1 - ekf_rms / dr_rms) * 100 if dr_rms > 0 else 0
         ukf_improvement = (1 - ukf_rms / dr_rms) * 100 if dr_rms > 0 else 0
         
+        # Scan matching metrics
+        scan_rms = 0.0
+        scan_success_rate = 0.0
+        if len(self.scan_errors) > 10:
+            scan_errors = np.array(self.scan_errors)
+            scan_rms = np.sqrt(np.mean(scan_errors**2))
+        if self.scan_match_count > 0:
+            scan_success_rate = self.scan_match_success_count / self.scan_match_count * 100
+        
         # Publish as Float64MultiArray
         msg = Float64MultiArray()
         msg.data = [ekf_rms, ekf_max, ekf_current, ukf_rms, ukf_max, ukf_current, 
-                    dr_rms, dr_max, dr_current, ekf_improvement, ukf_improvement]
+                    dr_rms, dr_max, dr_current, ekf_improvement, ukf_improvement,
+                    scan_rms, scan_success_rate]
         self.metrics_pub.publish(msg)
         
         # Log to console
         gps_status = "GPS: OUT" if self.in_gps_outage else "GPS: OK"
+        scan_status = f"Scan: {scan_success_rate:.0f}%" if self.enable_scan_matching else "Scan: OFF"
         self.get_logger().info(
-            f'{gps_status} | EKF: RMS={ekf_rms:.3f}m | UKF: RMS={ukf_rms:.3f}m | '
-            f'DR: RMS={dr_rms:.3f}m | EKF Imp: {ekf_improvement:.1f}% | UKF Imp: {ukf_improvement:.1f}%'
+            f'{gps_status} | {scan_status} | EKF: {ekf_rms:.3f}m | UKF: {ukf_rms:.3f}m | '
+            f'DR: {dr_rms:.3f}m | Imp: {ekf_improvement:.1f}%'
         )
 
 

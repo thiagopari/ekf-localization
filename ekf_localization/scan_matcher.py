@@ -1,381 +1,419 @@
-#!/usr/bin/env python3
 """
-Point-to-Line ICP Scan Matcher for 2D LiDAR
-Implements PL-ICP with quadratic convergence for robot localization
+Robust 2D LiDAR Scan Matching Module
+
+Implements trimmed ICP with:
+- Point-to-point alignment using SVD
+- Outlier rejection via trimming
+- Multi-resolution coarse-to-fine alignment
+- Covariance estimation from fitness
+- Failure detection
+
+For use with ROS2 sensor_msgs/LaserScan
 """
 
 import numpy as np
-from scipy.spatial import KDTree
+from scipy.spatial import cKDTree
 from typing import Tuple, Optional
-from dataclasses import dataclass
 
 
-@dataclass
-class ScanMatchResult:
-    """Result of scan matching operation"""
-    success: bool
-    transform: np.ndarray  # [dx, dy, dtheta]
-    covariance: np.ndarray  # 3x3 covariance matrix
-    fitness: float  # Fitness score (0-1, higher is better)
-    inlier_rmse: float  # RMSE of inlier correspondences
-    num_iterations: int
-    
-    
 class ScanMatcher:
     """
-    Point-to-Line ICP scan matcher for 2D LiDAR localization.
-    
-    Implements the Point-to-Line ICP variant from Censi (2008) which achieves
-    quadratic convergence by projecting error onto surface normals.
+    Robust 2D scan matcher using trimmed ICP.
     """
     
-    def __init__(self,
-                 max_iterations: int = 15,
+    def __init__(self, 
+                 max_iterations: int = 50,
                  convergence_threshold: float = 1e-6,
-                 max_correspondence_distance: float = 0.3,
-                 min_fitness: float = 0.3,
-                 max_inlier_rmse: float = 0.02,
-                 voxel_size: float = 0.02,
-                 range_min: float = 0.12,
-                 range_max: float = 2.8):
+                 max_correspondence_dist: float = 0.5,
+                 trim_ratio: float = 0.8,
+                 min_points: int = 50):
         """
         Initialize scan matcher.
         
         Args:
-            max_iterations: Maximum ICP iterations
-            convergence_threshold: Stop when transform change < threshold
-            max_correspondence_distance: Maximum distance for point matching (m)
-            min_fitness: Minimum fitness score to accept result (0-1)
-            max_inlier_rmse: Maximum RMSE of inliers to accept result (m)
-            voxel_size: Voxel size for downsampling (m)
-            range_min: Minimum valid range reading (m)
-            range_max: Maximum valid range reading (m)
+            max_iterations: Maximum ICP iterations per resolution level
+            convergence_threshold: Stop when RMSE change is below this
+            max_correspondence_dist: Maximum distance for valid correspondences
+            trim_ratio: Fraction of closest correspondences to keep (0.7-0.9)
+            min_points: Minimum points required for valid matching
         """
         self.max_iterations = max_iterations
         self.convergence_threshold = convergence_threshold
-        self.max_correspondence_distance = max_correspondence_distance
-        self.min_fitness = min_fitness
-        self.max_inlier_rmse = max_inlier_rmse
-        self.voxel_size = voxel_size
-        self.range_min = range_min
-        self.range_max = range_max
+        self.max_correspondence_dist = max_correspondence_dist
+        self.trim_ratio = trim_ratio
+        self.min_points = min_points
         
-        self.prev_scan_points = None
-        self.prev_normals = None
+        # Previous scan storage
+        self.prev_scan = None
         
-    def scan_to_points(self, ranges: np.ndarray, angles: np.ndarray) -> np.ndarray:
+        # Multi-resolution voxel sizes (coarse to fine)
+        self.voxel_sizes = [0.1, 0.05, 0.02]
+    
+    def laserscan_to_points(self, ranges: np.ndarray, 
+                            angle_min: float, 
+                            angle_max: float,
+                            range_min: float = 0.1,
+                            range_max: float = 30.0) -> np.ndarray:
         """
-        Convert LaserScan ranges to 2D point cloud.
+        Convert laser scan ranges to 2D point array.
         
         Args:
-            ranges: Array of range measurements (m)
-            angles: Array of angles for each range (rad)
+            ranges: Array of range measurements
+            angle_min: Start angle (radians)
+            angle_max: End angle (radians)
+            range_min: Minimum valid range
+            range_max: Maximum valid range
             
         Returns:
-            Nx2 array of [x, y] points in sensor frame
+            Nx2 numpy array of [x, y] points
         """
+        angles = np.linspace(angle_min, angle_max, len(ranges))
+        
         # Filter invalid readings
-        valid_mask = (ranges > self.range_min) & (ranges < self.range_max) & np.isfinite(ranges)
-        valid_ranges = ranges[valid_mask]
-        valid_angles = angles[valid_mask]
+        valid = (np.isfinite(ranges) & 
+                 (ranges >= range_min) & 
+                 (ranges <= range_max) &
+                 (ranges > 0.0))
         
-        # Convert polar to Cartesian
-        x = valid_ranges * np.cos(valid_angles)
-        y = valid_ranges * np.sin(valid_angles)
+        x = ranges[valid] * np.cos(angles[valid])
+        y = ranges[valid] * np.sin(angles[valid])
         
-        points = np.column_stack([x, y])
-        return points
+        return np.column_stack([x, y])
     
-    def voxel_downsample(self, points: np.ndarray) -> np.ndarray:
+    def voxel_downsample(self, points: np.ndarray, 
+                         voxel_size: float) -> np.ndarray:
         """
         Downsample point cloud using voxel grid.
         
         Args:
-            points: Nx2 array of points
+            points: Nx2 point array
+            voxel_size: Size of voxel grid cells
             
         Returns:
-            Mx2 array of downsampled points (M <= N)
+            Downsampled point array
         """
         if len(points) == 0:
             return points
             
         # Quantize points to voxel grid
-        voxel_indices = np.floor(points / self.voxel_size).astype(int)
+        quantized = np.floor(points / voxel_size).astype(int)
         
-        # Find unique voxels
-        unique_voxels, inverse_indices = np.unique(voxel_indices, axis=0, return_inverse=True)
+        # Find unique voxels and compute centroids
+        unique_voxels, inverse = np.unique(quantized, axis=0, return_inverse=True)
         
-        # Compute centroid for each voxel
+        # Compute mean point per voxel
         downsampled = np.zeros((len(unique_voxels), 2))
-        for i in range(len(unique_voxels)):
-            mask = inverse_indices == i
-            downsampled[i] = np.mean(points[mask], axis=0)
-            
+        counts = np.zeros(len(unique_voxels))
+        
+        np.add.at(downsampled, inverse, points)
+        np.add.at(counts, inverse, 1)
+        
+        downsampled /= counts[:, np.newaxis]
+        
         return downsampled
     
-    def estimate_normals(self, points: np.ndarray, k: int = 5) -> np.ndarray:
+    def find_correspondences(self, source: np.ndarray, 
+                            target: np.ndarray) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
-        Estimate surface normals using local neighborhood.
-        
-        For 2D, the normal is perpendicular to the line fitted through k neighbors.
+        Find nearest neighbor correspondences with trimming.
         
         Args:
-            points: Nx2 array of points
-            k: Number of neighbors to use
+            source: Source point cloud
+            target: Target point cloud
             
         Returns:
-            Nx2 array of unit normals
+            Tuple of (trimmed_source, trimmed_target, distances)
         """
-        if len(points) < k:
-            # Not enough points, use pointing-inward normals
-            normals = -points / (np.linalg.norm(points, axis=1, keepdims=True) + 1e-6)
-            return normals
-            
-        # Build KD-tree for neighbor search
-        tree = KDTree(points)
-        normals = np.zeros_like(points)
+        tree = cKDTree(target)
+        distances, indices = tree.query(source, k=1)
         
-        for i, point in enumerate(points):
-            # Find k nearest neighbors
-            _, indices = tree.query(point, k=min(k, len(points)))
-            neighbors = points[indices]
-            
-            # Fit line using PCA: compute covariance and take smallest eigenvector
-            centered = neighbors - neighbors.mean(axis=0)
-            cov = centered.T @ centered
-            eigenvalues, eigenvectors = np.linalg.eigh(cov)
-            
-            # Normal is the eigenvector with smallest eigenvalue (perpendicular to line)
-            normal = eigenvectors[:, 0]
-            
-            # Orient normal toward sensor origin (assuming sensor at origin)
-            if np.dot(normal, -point) < 0:
-                normal = -normal
-                
-            normals[i] = normal / (np.linalg.norm(normal) + 1e-6)
-            
-        return normals
+        # Apply distance threshold
+        valid = distances < self.max_correspondence_dist
+        
+        if np.sum(valid) < self.min_points:
+            # Not enough valid correspondences
+            return None, None, None
+        
+        distances = distances[valid]
+        indices = indices[valid]
+        source_valid = source[valid]
+        
+        # Trimmed ICP: keep only closest trim_ratio fraction
+        num_keep = max(int(len(distances) * self.trim_ratio), self.min_points)
+        sorted_idx = np.argsort(distances)[:num_keep]
+        
+        trimmed_source = source_valid[sorted_idx]
+        trimmed_target = target[indices[sorted_idx]]
+        trimmed_distances = distances[sorted_idx]
+        
+        return trimmed_source, trimmed_target, trimmed_distances
     
-    def point_to_line_icp(self,
-                          source: np.ndarray,
-                          target: np.ndarray,
-                          target_normals: np.ndarray,
-                          initial_transform: Optional[np.ndarray] = None) -> ScanMatchResult:
+    def compute_transform_svd(self, source: np.ndarray, 
+                              target: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
         """
-        Point-to-Line ICP alignment.
-        
-        Minimizes: Σᵢ (nᵢᵀ · (Rp_i + t - q_i))²
-        where nᵢ is the normal at matched target point q_i
+        Compute rigid transformation using SVD (Procrustes analysis).
         
         Args:
-            source: Mx2 source points
-            target: Nx2 target points
-            target_normals: Nx2 normals at target points
-            initial_transform: Initial [dx, dy, dtheta] guess
+            source: Source points (matched)
+            target: Target points (matched)
             
         Returns:
-            ScanMatchResult with transformation and diagnostics
+            Tuple of (2x2 rotation matrix, 2x1 translation vector)
         """
-        if len(source) < 3 or len(target) < 3:
-            return ScanMatchResult(
-                success=False,
-                transform=np.zeros(3),
-                covariance=np.eye(3) * 1e6,
-                fitness=0.0,
-                inlier_rmse=float('inf'),
-                num_iterations=0
-            )
+        # Compute centroids
+        src_centroid = source.mean(axis=0)
+        tgt_centroid = target.mean(axis=0)
         
-        # Build KD-tree for target
-        target_tree = KDTree(target)
+        # Center the points
+        src_centered = source - src_centroid
+        tgt_centered = target - tgt_centroid
         
-        # Initialize transformation
-        if initial_transform is None:
-            transform = np.zeros(3)  # [dx, dy, dtheta]
-        else:
-            transform = initial_transform.copy()
+        # Compute cross-covariance matrix
+        H = src_centered.T @ tgt_centered
         
-        source_transformed = source.copy()
+        # SVD decomposition
+        U, _, Vt = np.linalg.svd(H)
         
-        # ICP iterations
-        for iteration in range(self.max_iterations):
-            # Apply current transformation to source
-            c, s = np.cos(transform[2]), np.sin(transform[2])
-            R = np.array([[c, -s], [s, c]])
-            source_transformed = (R @ source.T).T + transform[:2]
+        # Compute rotation
+        R = Vt.T @ U.T
+        
+        # Handle reflection case
+        if np.linalg.det(R) < 0:
+            Vt[-1, :] *= -1
+            R = Vt.T @ U.T
+        
+        # Compute translation
+        t = tgt_centroid - R @ src_centroid
+        
+        return R, t
+    
+    def apply_transform(self, points: np.ndarray, 
+                        R: np.ndarray, 
+                        t: np.ndarray) -> np.ndarray:
+        """Apply rigid transformation to points."""
+        return (R @ points.T).T + t
+    
+    def icp_single_scale(self, source: np.ndarray, 
+                         target: np.ndarray,
+                         max_iter: Optional[int] = None) -> Tuple[np.ndarray, np.ndarray, float, int]:
+        """
+        Single-scale ICP alignment.
+        
+        Args:
+            source: Source point cloud
+            target: Target point cloud
+            max_iter: Override for max iterations
             
-            # Find correspondences using nearest neighbor
-            distances, indices = target_tree.query(source_transformed)
+        Returns:
+            Tuple of (rotation, translation, rmse, num_correspondences)
+        """
+        if max_iter is None:
+            max_iter = self.max_iterations
             
-            # Filter correspondences by distance
-            valid_mask = distances < self.max_correspondence_distance
-            if np.sum(valid_mask) < 3:
-                # Too few correspondences
-                return ScanMatchResult(
-                    success=False,
-                    transform=transform,
-                    covariance=np.eye(3) * 1e6,
-                    fitness=0.0,
-                    inlier_rmse=float('inf'),
-                    num_iterations=iteration
-                )
+        src = source.copy()
+        R_total = np.eye(2)
+        t_total = np.zeros(2)
+        prev_rmse = float('inf')
+        
+        for iteration in range(max_iter):
+            # Find correspondences
+            src_matched, tgt_matched, distances = self.find_correspondences(src, target)
             
-            source_matched = source_transformed[valid_mask]
-            target_matched = target[indices[valid_mask]]
-            normals_matched = target_normals[indices[valid_mask]]
+            if src_matched is None:
+                # Not enough correspondences
+                return R_total, t_total, float('inf'), 0
             
-            # Solve for incremental transformation using point-to-plane formulation
-            # Build linear system: A @ [dx, dy, dtheta]ᵀ = b
-            A = np.zeros((len(source_matched), 3))
-            b = np.zeros(len(source_matched))
+            # Compute transformation
+            R, t = self.compute_transform_svd(src_matched, tgt_matched)
             
-            for i in range(len(source_matched)):
-                p = source_matched[i]
-                q = target_matched[i]
-                n = normals_matched[i]
-                
-                # Point-to-plane error: nᵀ(p - q)
-                error = n @ (p - q)
-                
-                # Jacobian: ∂(Rp + t - q)/∂[dx, dy, dtheta]
-                # For small dtheta: R ≈ [1, -dtheta; dtheta, 1]
-                # So: ∂(Rp)/∂theta ≈ [-p_y, p_x]
-                A[i, 0] = n[0]  # ∂/∂dx
-                A[i, 1] = n[1]  # ∂/∂dy
-                A[i, 2] = n @ np.array([-p[1], p[0]])  # ∂/∂dtheta
-                
-                b[i] = -error
+            # Apply transformation
+            src = self.apply_transform(src, R, t)
             
-            # Solve least squares: delta = (AᵀA)⁻¹Aᵀb
-            try:
-                delta = np.linalg.lstsq(A, b, rcond=None)[0]
-            except np.linalg.LinAlgError:
-                # Singular system
-                return ScanMatchResult(
-                    success=False,
-                    transform=transform,
-                    covariance=np.eye(3) * 1e6,
-                    fitness=0.0,
-                    inlier_rmse=float('inf'),
-                    num_iterations=iteration
-                )
-            
-            # Update transformation
-            transform += delta
-            
-            # Normalize angle to [-π, π]
-            transform[2] = np.arctan2(np.sin(transform[2]), np.cos(transform[2]))
+            # Accumulate transformation
+            R_total = R @ R_total
+            t_total = R @ t_total + t
             
             # Check convergence
-            if np.linalg.norm(delta) < self.convergence_threshold:
+            rmse = np.sqrt(np.mean(distances**2))
+            if abs(prev_rmse - rmse) < self.convergence_threshold:
                 break
+            prev_rmse = rmse
         
-        # Compute final fitness and RMSE
-        c, s = np.cos(transform[2]), np.sin(transform[2])
-        R = np.array([[c, -s], [s, c]])
-        source_final = (R @ source.T).T + transform[:2]
-        distances, _ = target_tree.query(source_final)
-        
-        inlier_mask = distances < self.max_correspondence_distance
-        fitness = np.sum(inlier_mask) / len(source)
-        inlier_rmse = np.sqrt(np.mean(distances[inlier_mask]**2)) if np.any(inlier_mask) else float('inf')
-        
-        # Estimate covariance from Hessian
-        covariance = self.estimate_covariance(A, inlier_rmse)
-        
-        # Validate result
-        success = (fitness >= self.min_fitness and inlier_rmse <= self.max_inlier_rmse)
-        
-        return ScanMatchResult(
-            success=success,
-            transform=transform,
-            covariance=covariance,
-            fitness=fitness,
-            inlier_rmse=inlier_rmse,
-            num_iterations=iteration + 1
-        )
+        return R_total, t_total, rmse, len(src_matched) if src_matched is not None else 0
     
-    def estimate_covariance(self, A: np.ndarray, sigma: float) -> np.ndarray:
+    def match(self, current_scan: np.ndarray, 
+              initial_guess: Optional[np.ndarray] = None) -> Tuple[np.ndarray, float, float, int, bool]:
         """
-        Estimate transformation covariance from Hessian.
-        
-        Cov ≈ σ² × (AᵀA)⁻¹
+        Match current scan against previous scan using multi-resolution ICP.
         
         Args:
-            A: Jacobian matrix from last ICP iteration
-            sigma: Measurement noise standard deviation (m)
+            current_scan: Nx2 array of current scan points
+            initial_guess: Optional [x, y, theta] initial transformation
             
         Returns:
-            3x3 covariance matrix
+            Tuple of (delta_pose [x, y, theta], rmse, fitness, num_correspondences, success)
         """
-        H = A.T @ A  # Hessian approximation
+        if self.prev_scan is None or len(current_scan) < self.min_points:
+            self.prev_scan = current_scan
+            return np.zeros(3), 0.0, 0.0, 0, False
         
-        # Check conditioning
-        condition_number = np.linalg.cond(H)
-        if condition_number > 1000:
-            # Degenerate geometry, inflate covariance
-            return np.eye(3) * sigma**2 * condition_number
+        if len(self.prev_scan) < self.min_points:
+            self.prev_scan = current_scan
+            return np.zeros(3), 0.0, 0.0, 0, False
         
-        try:
-            H_inv = np.linalg.inv(H)
-            covariance = sigma**2 * H_inv
+        # Apply initial guess if provided
+        source = current_scan.copy()
+        if initial_guess is not None:
+            c, s = np.cos(initial_guess[2]), np.sin(initial_guess[2])
+            R_init = np.array([[c, -s], [s, c]])
+            t_init = initial_guess[:2]
+            source = self.apply_transform(source, R_init, t_init)
+        
+        # Multi-resolution alignment
+        R_total = np.eye(2)
+        t_total = np.zeros(2)
+        
+        for i, voxel_size in enumerate(self.voxel_sizes):
+            # Downsample both clouds
+            src_ds = self.voxel_downsample(source, voxel_size)
+            tgt_ds = self.voxel_downsample(self.prev_scan, voxel_size)
             
-            # Ensure positive definite
-            eigenvalues = np.linalg.eigvalsh(covariance)
-            if np.any(eigenvalues < 0):
-                covariance = np.eye(3) * sigma**2
-                
-            return covariance
-        except np.linalg.LinAlgError:
-            # Singular Hessian
-            return np.eye(3) * 1e6
-    
-    def process_scan(self,
-                     ranges: np.ndarray,
-                     angles: np.ndarray,
-                     odom_delta: Optional[np.ndarray] = None) -> Optional[ScanMatchResult]:
-        """
-        Process new scan and return relative motion estimate.
-        
-        Args:
-            ranges: Range measurements from LaserScan (m)
-            angles: Angles for each range (rad)
-            odom_delta: Odometry-based motion estimate [dx, dy, dtheta] as initial guess
+            # More iterations for coarse level, fewer for fine
+            max_iter = self.max_iterations if i == 0 else self.max_iterations // 2
             
-        Returns:
-            ScanMatchResult or None if first scan or failure
-        """
-        # Convert scan to points
-        points = self.scan_to_points(ranges, angles)
+            # Run ICP at this scale
+            R, t, rmse, num_corr = self.icp_single_scale(src_ds, tgt_ds, max_iter)
+            
+            # Apply to full-resolution source
+            source = self.apply_transform(source, R, t)
+            
+            # Accumulate transformation
+            R_total = R @ R_total
+            t_total = R @ t_total + t
         
-        if len(points) < 10:
-            # Too few valid points
-            return None
-        
-        # Downsample
-        points_down = self.voxel_downsample(points)
-        
-        if self.prev_scan_points is None:
-            # First scan - initialize
-            self.prev_scan_points = points_down
-            self.prev_normals = self.estimate_normals(points_down)
-            return None
-        
-        # Estimate normals for previous scan if not available
-        if self.prev_normals is None:
-            self.prev_normals = self.estimate_normals(self.prev_scan_points)
-        
-        # Run ICP: align current scan to previous scan
-        result = self.point_to_line_icp(
-            source=points_down,
-            target=self.prev_scan_points,
-            target_normals=self.prev_normals,
-            initial_transform=odom_delta
+        # Final refinement at full resolution (limited points for speed)
+        if len(source) > 200:
+            idx = np.random.choice(len(source), 200, replace=False)
+            src_sample = source[idx]
+        else:
+            src_sample = source
+            
+        R_final, t_final, final_rmse, num_correspondences = self.icp_single_scale(
+            src_sample, self.prev_scan, max_iter=10
         )
         
-        # Update reference scan
-        if result.success:
-            self.prev_scan_points = points_down
-            self.prev_normals = self.estimate_normals(points_down)
+        R_total = R_final @ R_total
+        t_total = R_final @ t_total + t_final
         
-        return result
+        # Include initial guess in total transformation
+        if initial_guess is not None:
+            c, s = np.cos(initial_guess[2]), np.sin(initial_guess[2])
+            R_init = np.array([[c, -s], [s, c]])
+            R_total = R_total @ R_init
+            t_total = R_total @ initial_guess[:2] + t_total
+        
+        # Extract [x, y, theta] from transformation
+        theta = np.arctan2(R_total[1, 0], R_total[0, 0])
+        delta_pose = np.array([t_total[0], t_total[1], theta])
+        
+        # Compute fitness (fraction of points with good correspondences)
+        tree = cKDTree(self.prev_scan)
+        distances, _ = tree.query(source, k=1)
+        fitness = np.mean(distances < self.max_correspondence_dist)
+        
+        # Determine success
+        success = (fitness > 0.3 and 
+                   final_rmse < 0.1 and 
+                   num_correspondences >= self.min_points)
+        
+        # Update previous scan
+        self.prev_scan = current_scan
+        
+        return delta_pose, final_rmse, fitness, num_correspondences, success
+    
+    def estimate_covariance(self, fitness: float, 
+                           rmse: float, 
+                           num_correspondences: int,
+                           base_variance: float = 0.01) -> np.ndarray:
+        """
+        Estimate measurement covariance from ICP quality metrics.
+        
+        Args:
+            fitness: Fraction of inlier correspondences
+            rmse: Root mean square error of alignment
+            num_correspondences: Number of correspondences used
+            base_variance: Base variance for perfect match
+            
+        Returns:
+            3x3 covariance matrix for [x, y, theta]
+        """
+        # Scale factor based on quality
+        if fitness < 0.3:
+            scale = 100.0  # Very uncertain
+        elif fitness > 0.8:
+            scale = 0.5 + rmse * 5  # High confidence
+        else:
+            # Linear interpolation
+            scale = 1.0 + (0.8 - fitness) * 20
+        
+        # Reduce uncertainty with more correspondences
+        corr_factor = max(1.0, 100.0 / num_correspondences)
+        scale *= corr_factor
+        
+        # Add RMSE contribution
+        scale *= (1.0 + rmse * 10)
+        
+        # Build covariance matrix
+        pos_var = base_variance * scale
+        theta_var = base_variance * scale * 0.5  # Angular usually more certain
+        
+        return np.diag([pos_var, pos_var, theta_var])
+    
+    def validate_match(self, delta_pose: np.ndarray,
+                      fitness: float,
+                      rmse: float,
+                      num_correspondences: int,
+                      dt: float,
+                      max_velocity: float = 2.0,
+                      max_angular_velocity: float = 2.0) -> Tuple[bool, str]:
+        """
+        Validate scan match result before using in filter.
+        
+        Args:
+            delta_pose: [x, y, theta] transformation
+            fitness: Match fitness score
+            rmse: Alignment RMSE
+            num_correspondences: Number of correspondences
+            dt: Time since last scan
+            max_velocity: Maximum plausible linear velocity (m/s)
+            max_angular_velocity: Maximum plausible angular velocity (rad/s)
+            
+        Returns:
+            Tuple of (is_valid, reason_string)
+        """
+        # Quality thresholds
+        if fitness < 0.3:
+            return False, "LOW_FITNESS"
+        
+        if rmse > 0.15:
+            return False, "HIGH_RMSE"
+        
+        if num_correspondences < self.min_points:
+            return False, "FEW_CORRESPONDENCES"
+        
+        # Physical plausibility
+        if dt > 0:
+            linear_vel = np.linalg.norm(delta_pose[:2]) / dt
+            angular_vel = abs(delta_pose[2]) / dt
+            
+            if linear_vel > max_velocity:
+                return False, "IMPLAUSIBLE_LINEAR_VELOCITY"
+            
+            if angular_vel > max_angular_velocity:
+                return False, "IMPLAUSIBLE_ANGULAR_VELOCITY"
+        
+        return True, "VALID"
+    
+    def reset(self):
+        """Reset the matcher state (clear previous scan)."""
+        self.prev_scan = None
