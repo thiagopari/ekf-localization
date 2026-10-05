@@ -26,12 +26,6 @@ This project implements a comprehensive localization system for the TurtleBot3 W
 - ✅ **GPS outage simulation** demonstrating filter robustness during sensor dropouts
 - ✅ **Comprehensive metrics** tracking RMS error, max error, and improvement over baseline
 
-### Target Applications
-
-This project was developed for:
-- General robotics co-op applications requiring state estimation skills
-- Demonstration of control theory, sensor fusion, and ROS2 proficiency
-
 ---
 
 ## System Architecture
