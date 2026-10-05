@@ -1,6 +1,6 @@
 # Multi-Sensor Fusion Localization for Mobile Robotics
 
-**Real-time sensor fusion system combining wheel odometry, IMU, simulated GPS, and LiDAR scan matching through Extended Kalman Filtering for robust mobile robot localization.**
+**Real-time sensor fusion system combining wheel odometry, IMU and simulated GPS through Extended and Unscented Kalman Filtering, with a LiDAR scan-matching update, for robust mobile robot localization.**
 
 [![ROS2](https://img.shields.io/badge/ROS2-Jazzy-blue)](https://docs.ros.org/en/jazzy/index.html)
 [![Python](https://img.shields.io/badge/Python-3.10+-green)](https://www.python.org/)
@@ -8,7 +8,7 @@
 
 **Author:** Thiago Pari  
 **Institution:** Northeastern University - Master's in Robotics  
-**Date:** December 2024
+**Date:** December 2025
 
 ---
 
@@ -224,7 +224,7 @@ This provides a baseline to quantify filter improvement.
 | Avg RMSE | 0.023 m |
 | Update Rate | ~6 Hz |
 
-*Note: LiDAR integration validated algorithmically but not tested in simulation due to GPU limitations. Code is production-ready for hardware deployment.*
+*Note: the scan-matching numbers above come from validating the ICP algorithm on its own. LiDAR did not run in the Gazebo simulation because of GPU limits, so the localization results above use odometry, IMU and simulated GPS only. Hardware testing is still to come.*
 
 ---
 
@@ -370,7 +370,7 @@ ekf-localization/
 1. **Simulation Environment**: 
    - LiDAR sensors not functional in Parallels + Apple Silicon + Gazebo Harmonic
    - OpenGL compatibility issues prevent full rendering pipeline
-   - Hardware testing scheduled for January 2025
+   - Not yet tested on a real TurtleBot3
 
 2. **Covariance Visualization**: 
    - Color change during GPS outage not working (marker stays blue)
@@ -389,7 +389,7 @@ ekf-localization/
    - Improve scan matching in ambiguous environments
 
 3. **Hardware Validation**: 
-   - Deploy to real TurtleBot3 hardware (January 2025)
+   - Deploy to real TurtleBot3 hardware
    - Compare simulated vs. real-world performance
 
 4. **Advanced Filtering**:
@@ -551,4 +551,4 @@ Northeastern University
 
 ---
 
-*Last Updated: December 2024*
+*Last Updated: October 2026*
