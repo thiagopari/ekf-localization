@@ -29,7 +29,6 @@ This project implements a comprehensive localization system for the TurtleBot3 W
 ### Target Applications
 
 This project was developed for:
-- **ASML Mechatronics Intern** position application
 - General robotics co-op applications requiring state estimation skills
 - Demonstration of control theory, sensor fusion, and ROS2 proficiency
 
