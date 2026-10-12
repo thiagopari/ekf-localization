@@ -35,8 +35,8 @@ Eigen::Matrix2d inverse_2x2(const Eigen::Matrix2d & A)
   return X;
 }
 
-// Python indexes rows of the lower Cholesky factor (sqrt_P[i]), not columns, so the spread is
-// L^T L instead of P whenever P has correlations. Mirrored as is; see the port notes.
+// Columns of the square root S (S S^T = (n + lambda) P), for both the Cholesky and the
+// eigendecomposition fallback, same as ukf.py.
 Sigma sigma_points(const Eigen::Vector3d & x, const Eigen::Matrix3d & P)
 {
   Eigen::Matrix3d sqrt_P;
@@ -52,8 +52,8 @@ Sigma sigma_points(const Eigen::Vector3d & x, const Eigen::Matrix3d & P)
   Sigma sp;
   sp.row(0) = x.transpose();
   for (int i = 0; i < N; ++i) {
-    sp.row(i + 1) = x.transpose() + sqrt_P.row(i);
-    sp.row(N + i + 1) = x.transpose() - sqrt_P.row(i);
+    sp.row(i + 1) = (x + sqrt_P.col(i)).transpose();
+    sp.row(N + i + 1) = (x - sqrt_P.col(i)).transpose();
   }
   return sp;
 }

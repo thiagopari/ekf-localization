@@ -74,10 +74,11 @@ class UKFLocalization:
             eigvals = np.maximum(eigvals, 1e-10)  # Ensure positive
             sqrt_P = eigvecs @ np.diag(np.sqrt((n + self.lambda_) * eigvals))
         
-        # Generate remaining sigma points
+        # Generate remaining sigma points from the COLUMNS of the square root
+        # (sqrt_P @ sqrt_P.T == (n + lambda) * P); rows would give sqrt_P.T @ sqrt_P instead
         for i in range(n):
-            sigma_points[i + 1] = x + sqrt_P[i]
-            sigma_points[n + i + 1] = x - sqrt_P[i]
+            sigma_points[i + 1] = x + sqrt_P[:, i]
+            sigma_points[n + i + 1] = x - sqrt_P[:, i]
         
         return sigma_points
     

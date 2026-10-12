@@ -3,6 +3,7 @@
 
     make_golden.py OUT.csv            # write the CSV the C++ golden test replays
     make_golden.py OUT.csv --bench    # also time the Python filters on the same sequence
+    make_golden.py OUT.csv --rms      # also print EKF / UKF / dead-reckoning RMS vs truth
 
 Each row is one step: predict(v, omega, dt); update_imu(z_imu); update_gps(gx, gy) if gps,
 followed by the EKF and UKF state and row-major covariance after that step.
@@ -46,7 +47,7 @@ def make_sequence():
     z_imu = (z_imu + np.pi) % (2 * np.pi) - np.pi      # IMU yaw arrives wrapped
     gps = (np.floor(t) > np.floor(t - dt)) & ~((t >= OUTAGE[0]) & (t < OUTAGE[1]))
     g = truth[:, :2] + rng.normal(0, 0.5, (n, 2))
-    return np.column_stack([v_odom, w_odom, dt, z_imu, gps, g])
+    return np.column_stack([v_odom, w_odom, dt, z_imu, gps, g]), truth
 
 
 def run(filt, seq):
@@ -78,14 +79,26 @@ def bench(make_filter, seq, reps=20):
 
 def main():
     out_csv = sys.argv[1]
-    seq = make_sequence()
+    seq, truth = make_sequence()
     cols = ['v', 'omega', 'dt', 'z_imu', 'gps', 'gx', 'gy']
     for name in ('ekf', 'ukf'):
         cols += [f'{name}_{c}' for c in ('x', 'y', 'th')]
         cols += [f'{name}_P{i}{j}' for i in range(3) for j in range(3)]
-    data = np.hstack([seq, run(EKFLocalization(), seq), run(UKFLocalization(), seq)])
+    ekf, ukf = run(EKFLocalization(), seq), run(UKFLocalization(), seq)
+    data = np.hstack([seq, ekf, ukf])
     np.savetxt(out_csv, data, delimiter=',', fmt='%.17g', header=','.join(cols), comments='')
     print(f'wrote {len(seq)} steps ({int(seq[:, 4].sum())} GPS fixes) to {out_csv}')
+
+    if '--rms' in sys.argv:
+        dr = np.zeros(3)
+        dr_xy = np.empty((len(seq), 2))
+        for k, (v, w, dt) in enumerate(seq[:, :3]):  # odometry only, no corrections
+            mid = dr[2] + w * dt / 2
+            dr = dr + [v * dt * np.cos(mid), v * dt * np.sin(mid), w * dt]
+            dr_xy[k] = dr[:2]
+        for name, xy in (('EKF', ekf[:, :2]), ('UKF', ukf[:, :2]), ('dead reckoning', dr_xy)):
+            err = np.linalg.norm(xy - truth[:, :2], axis=1)
+            print(f'{name} RMS position error: {np.sqrt(np.mean(err**2)):.4f} m')
 
     if '--bench' in sys.argv:
         for name, cls in (('EKF', EKFLocalization), ('UKF', UKFLocalization)):

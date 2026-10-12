@@ -72,3 +72,23 @@ TYPED_TEST(FilterTest, UpdatesReduceTrace) {
   f.update_imu(0.2);
   EXPECT_LT(f.P.trace(), before);
 }
+
+// Unscented transform of an identity motion with Q = 0 must give P back. With a correlated P
+// this fails if sigma points use Cholesky rows (L^T L) instead of columns (L L^T = P).
+TEST(UKF, SigmaPointsReproduceCorrelatedP) {
+  const Eigen::Matrix3d R = Eigen::AngleAxisd(0.7, Eigen::Vector3d(1, 2, 3).normalized()).matrix();
+  const Eigen::Matrix3d P_pd = R * Eigen::Vector3d(0.2, 0.1, 0.05).asDiagonal() * R.transpose();
+  // Indefinite P: Cholesky fails, the eigendecomposition fallback clamps -1e-4 to 1e-10.
+  const Eigen::Matrix3d P_bad = R * Eigen::Vector3d(0.2, 0.1, -1e-4).asDiagonal() * R.transpose();
+  const Eigen::Matrix3d P_bad_clamped =
+    R * Eigen::Vector3d(0.2, 0.1, 1e-10).asDiagonal() * R.transpose();
+
+  for (const auto & [P_in, expected] : {std::pair{P_pd, P_pd}, std::pair{P_bad, P_bad_clamped}}) {
+    UKF f;
+    f.x << 1.0, -2.0, 0.3;
+    f.P = P_in;
+    f.Q.setZero();
+    f.predict(0.0, 0.0, 0.1);  // x' = x
+    EXPECT_LT((f.P - expected).cwiseAbs().maxCoeff(), 1e-9);
+  }
+}
