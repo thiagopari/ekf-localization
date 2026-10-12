@@ -237,6 +237,8 @@ Measured on an Intel Core Ultra 7 255H (one pinned core, Release build, Python 3
 
 One step is a predict, an IMU update, and a GPS update once per second. The Python time is mostly interpreter and NumPy per-call overhead on 3x3 arrays, not arithmetic, so this compares NumPy on tiny matrices with fixed-size Eigen. It is not a general Python-vs-C++ result.
 
+**UKF fix (Oct 2026):** `ukf.py` built its sigma points from the rows of the Cholesky factor instead of its columns, so whenever P had correlations the sigma points spread as LᵀL instead of P. It is now fixed in both versions, and a new gtest checks that the sigma points reproduce a correlated P. The Gazebo table above was measured before the fix. On the seeded synthetic sequence the UKF's RMS error barely moves (0.4210 → 0.4209 m), because P stays nearly diagonal there.
+
 The ICP port has no golden test, because its final refinement step uses a random 200-point subsample in both versions. For two synthetic room scans with a known motion of (0.1 m, 0.05 m, 0.05 rad), the worst error over 2000 C++ runs was 4.7 mm in position and 3.9 mrad in heading.
 
 ```bash
