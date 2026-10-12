@@ -219,6 +219,34 @@ This provides a baseline to quantify filter improvement.
 
 *Note: the scan-matching numbers above come from validating the ICP algorithm on its own. LiDAR did not run in the Gazebo simulation because of GPU limits, so the localization results above use odometry, IMU and simulated GPS only. Hardware testing is still to come.*
 
+## C++ Port (draft)
+
+`cpp/` contains `ekf_localization_cpp`, an ament_cmake port of the filters and the node:
+
+- **`ekf_filters`**: a ROS-free C++17/Eigen library that ports `ekf.py` and `ukf.py` line for line (same motion model, Jacobians, noise values and angle wrapping)
+- **`ekf_node`**: an rclcpp port of `ekf_node.py` with the same topics, parameters and rates (odom-driven predict, IMU heading updates, 1 Hz simulated GPS with the outage option, 1 Hz metrics). The LiDAR scan-matching path is not ported yet.
+- **Tests (gtest)**: unit tests (a straight line with ω = 0, the covariance stays symmetric PSD, updates reduce the trace) and a golden test. In the golden test, `cpp/test/make_golden.py` runs the original Python `ekf.py`/`ukf.py` on a seeded 3000-step sequence (50 Hz odom + IMU, 1 Hz GPS, a 15 s GPS outage), and the C++ filters replay it.
+
+Measured on an Intel Core Ultra 7 255H (one pinned core, Release build, Python 3.12 + NumPy 1.26):
+
+| Filter | Max state difference vs Python (3000 steps) | C++ per step | Python per step | Speedup |
+|--------|---------------------------------------------|--------------|-----------------|---------|
+| EKF | 3.3e-16 | 0.052–0.054 µs | 13.9–14.2 µs | ~260x |
+| UKF | 0 (bit-identical) | 0.39–0.40 µs | 93.1–93.7 µs | ~235x |
+
+One step is a predict, an IMU update, and a GPS update once per second. The Python time is mostly interpreter and NumPy per-call overhead on 3x3 arrays, not arithmetic, so this compares NumPy on tiny matrices with fixed-size Eigen. It is not a general Python-vs-C++ result.
+
+```bash
+# The repo root is itself a package, so colcon needs both base paths to find cpp/
+colcon build --base-paths src/ekf-localization src/ekf-localization/cpp --cmake-args -DCMAKE_BUILD_TYPE=Release
+colcon test --base-paths src/ekf-localization/cpp && colcon test-result --verbose
+ros2 launch ekf_localization_cpp ekf_cpp.launch.py enable_gps_outage:=true
+
+# Benchmark (same sequence for both)
+python3 src/ekf-localization/cpp/test/make_golden.py /tmp/golden.csv --bench
+./build/ekf_localization_cpp/bench_filters /tmp/golden.csv
+```
+
 ---
 
 ## Installation

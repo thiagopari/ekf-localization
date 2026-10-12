@@ -1,0 +1,36 @@
+name: ci-cpp
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-24.04
+    container: ros:jazzy
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: src/ekf-localization
+
+      - name: Install dependencies
+        run: |
+          apt-get update
+          rosdep update --rosdistro jazzy
+          rosdep install -y --rosdistro jazzy --ignore-src --from-paths src/ekf-localization/cpp
+
+      # The repo root is the Python package, so colcon will not descend into cpp/ on its own.
+      - name: Build
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon build --base-paths src/ekf-localization src/ekf-localization/cpp \
+            --cmake-args -DCMAKE_BUILD_TYPE=Release
+
+      - name: Test
+        run: |
+          source /opt/ros/jazzy/setup.bash
+          colcon test --base-paths src/ekf-localization/cpp --event-handlers console_direct+
+          colcon test-result --verbose
