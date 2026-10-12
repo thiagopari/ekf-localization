@@ -224,8 +224,9 @@ This provides a baseline to quantify filter improvement.
 `cpp/` contains `ekf_localization_cpp`, an ament_cmake port of the filters and the node:
 
 - **`ekf_filters`**: a ROS-free C++17/Eigen library that ports `ekf.py` and `ukf.py` line for line (same motion model, Jacobians, noise values and angle wrapping)
-- **`ekf_node`**: an rclcpp port of `ekf_node.py` with the same topics, parameters and rates (odom-driven predict, IMU heading updates, 1 Hz simulated GPS with the outage option, 1 Hz metrics). The LiDAR scan-matching path is not ported yet.
-- **Tests (gtest)**: unit tests (a straight line with ω = 0, the covariance stays symmetric PSD, updates reduce the trace) and a golden test. In the golden test, `cpp/test/make_golden.py` runs the original Python `ekf.py`/`ukf.py` on a seeded 3000-step sequence (50 Hz odom + IMU, 1 Hz GPS, a 15 s GPS outage), and the C++ filters replay it.
+- **`scan_matcher`**: the multi-resolution trimmed ICP from `scan_matcher.py`, with PCL's `KdTreeFLANN` in place of scipy's `cKDTree`
+- **`ekf_node`**: an rclcpp port of `ekf_node.py` with the same topics, parameters and rates (odom-driven predict, IMU heading updates, 1 Hz simulated GPS with the outage option, LiDAR scan matching, 1 Hz metrics)
+- **Tests (gtest)**: unit tests (a straight line with ω = 0, the covariance stays symmetric PSD, updates reduce the trace, ICP recovers a known motion between two synthetic room scans) and a golden test. In the golden test, `cpp/test/make_golden.py` runs the original Python `ekf.py`/`ukf.py` on a seeded 3000-step sequence (50 Hz odom + IMU, 1 Hz GPS, a 15 s GPS outage), and the C++ filters replay it.
 
 Measured on an Intel Core Ultra 7 255H (one pinned core, Release build, Python 3.12 + NumPy 1.26):
 
@@ -235,6 +236,8 @@ Measured on an Intel Core Ultra 7 255H (one pinned core, Release build, Python 3
 | UKF | 0 (bit-identical) | 0.39–0.40 µs | 93.1–93.7 µs | ~235x |
 
 One step is a predict, an IMU update, and a GPS update once per second. The Python time is mostly interpreter and NumPy per-call overhead on 3x3 arrays, not arithmetic, so this compares NumPy on tiny matrices with fixed-size Eigen. It is not a general Python-vs-C++ result.
+
+The ICP port has no golden test, because its final refinement step uses a random 200-point subsample in both versions. For two synthetic room scans with a known motion of (0.1 m, 0.05 m, 0.05 rad), the worst error over 2000 C++ runs was 4.7 mm in position and 3.9 mrad in heading.
 
 ```bash
 # The repo root is itself a package, so colcon needs both base paths to find cpp/

@@ -1,12 +1,11 @@
 // rclcpp port of ekf_localization/ekf_node.py: same topics, parameters, rates and outputs.
-// Not ported: the LiDAR scan-matching path (/scan, /scan_path, enable_scan_matching).
-// The Python ICP was only validated standalone; the README results do not use it.
 
 #include <algorithm>
 #include <cmath>
 #include <memory>
 #include <optional>
 #include <random>
+#include <string>
 #include <vector>
 
 #include "geometry_msgs/msg/pose_stamped.hpp"
@@ -15,11 +14,13 @@
 #include "nav_msgs/msg/path.hpp"
 #include "rclcpp/rclcpp.hpp"
 #include "sensor_msgs/msg/imu.hpp"
+#include "sensor_msgs/msg/laser_scan.hpp"
 #include "std_msgs/msg/float64_multi_array.hpp"
 #include "tf2_ros/transform_broadcaster.h"
 #include "visualization_msgs/msg/marker.hpp"
 
 #include "ekf_localization_cpp/ekf.hpp"
+#include "ekf_localization_cpp/scan_matcher.hpp"
 #include "ekf_localization_cpp/ukf.hpp"
 
 using geometry_msgs::msg::PoseStamped;
@@ -87,6 +88,8 @@ public:
     gps_outage_start_(declare_parameter("gps_outage_start", 30.0)),
     gps_outage_duration_(declare_parameter("gps_outage_duration", 15.0)),
     enable_gps_outage_(declare_parameter("enable_gps_outage", false)),
+    enable_scan_matching_(declare_parameter("enable_scan_matching", true)),
+    scan_match_min_interval_(declare_parameter("scan_match_min_interval", 0.1)),
     gps_period_(1.0 / gps_rate_),
     rng_(std::random_device{}())
   {
@@ -102,8 +105,9 @@ public:
     odom_path_pub_ = create_publisher<Path>("odom_path", 10);
     dr_path_pub_ = create_publisher<Path>("dr_path", 10);
     cov_marker_pub_ = create_publisher<Marker>("ekf_covariance", 10);
+    scan_path_pub_ = create_publisher<Path>("scan_path", 10);
     metrics_pub_ = create_publisher<std_msgs::msg::Float64MultiArray>("ekf_metrics", 10);
-    for (Path * p : {&ekf_path_, &ukf_path_, &odom_path_, &dr_path_}) {
+    for (Path * p : {&ekf_path_, &ukf_path_, &odom_path_, &dr_path_, &scan_path_}) {
       p->header.frame_id = "odom";
     }
 
@@ -116,6 +120,8 @@ public:
         ekf_.update_imu(yaw);
         ukf_.update_imu(yaw);
       });
+    scan_sub_ = create_subscription<sensor_msgs::msg::LaserScan>(
+      "scan", 10, [this](const sensor_msgs::msg::LaserScan & msg) {scan_callback(msg);});
 
     RCLCPP_INFO(get_logger(), "EKF Localization Node started (C++)");
     RCLCPP_INFO(get_logger(), "  GPS rate: %.1f Hz", gps_rate_);
@@ -125,7 +131,8 @@ public:
         get_logger(), "  GPS outage enabled: starts at %.1fs, duration %.1fs",
         gps_outage_start_, gps_outage_duration_);
     }
-    RCLCPP_INFO(get_logger(), "  Scan matching: not ported");
+    RCLCPP_INFO(
+      get_logger(), "  Scan matching: %s", enable_scan_matching_ ? "enabled" : "disabled");
   }
 
 private:
@@ -206,6 +213,72 @@ private:
   double error_to_truth(double x, double y) const
   {
     return std::hypot(x - ground_truth_pos_.x(), y - ground_truth_pos_.y());
+  }
+
+  void scan_callback(const sensor_msgs::msg::LaserScan & msg)
+  {
+    if (!enable_scan_matching_) {
+      return;
+    }
+    const double current_time = rclcpp::Time(msg.header.stamp).seconds();
+    double dt = 0.1;  // default for the first scan
+    if (last_scan_time_) {
+      dt = current_time - *last_scan_time_;
+      if (dt < scan_match_min_interval_) {
+        return;
+      }
+    }
+
+    const auto points = ekf_localization_cpp::ScanMatcher::laserscan_to_points(
+      msg.ranges, msg.angle_min, msg.angle_max, msg.range_min, msg.range_max);
+    if (points.cols() < 50) {
+      return;
+    }
+
+    const auto r = scan_matcher_.match(points);
+    ++scan_match_count_;
+    if (r.success) {
+      ++scan_match_success_count_;
+      const Eigen::Vector3d & d = r.delta_pose;
+      const std::string reason =
+        scan_matcher_.validate_match(d, r.fitness, r.rmse, r.num_correspondences, dt);
+      if (reason == "VALID") {
+        RCLCPP_INFO(
+          get_logger(), "VALID match: delta=[%.3f, %.3f, %.3f], fitness=%.2f, rmse=%.4f, corr=%d",
+          d(0), d(1), d(2), r.fitness, r.rmse, r.num_correspondences);
+
+        // Delta rotated by the scan-only heading, as in ekf_node.py.
+        const double c = std::cos(scan_match_pose_(2)), s = std::sin(scan_match_pose_(2));
+        const Eigen::Vector2d step(c * d(0) - s * d(1), s * d(0) + c * d(1));
+        scan_match_pose_.head<2>() += step;
+        scan_match_pose_(2) += d(2);
+        RCLCPP_INFO(
+          get_logger(), "Accumulated scan_pose: [%.3f, %.3f, %.3f]",
+          scan_match_pose_(0), scan_match_pose_(1), scan_match_pose_(2));
+
+        // Position measurement = current EKF position + that delta, with ICP-derived noise,
+        // applied through the GPS update with R_gps swapped in and restored.
+        const Eigen::Matrix3d R_scan =
+          scan_matcher_.estimate_covariance(r.fitness, r.rmse, r.num_correspondences);
+        const Eigen::Vector2d z = ekf_.x.head<2>() + step;
+        const Eigen::Matrix2d saved_R_gps = ekf_.R_gps;
+        ekf_.R_gps = ukf_.R_gps = R_scan.topLeftCorner<2, 2>();
+        ekf_.update_gps(z);
+        ukf_.update_gps(z);
+        ekf_.R_gps = ukf_.R_gps = saved_R_gps;
+
+        publish_path(
+          scan_path_, scan_path_pub_,
+          make_pose(msg.header.stamp, scan_match_pose_(0), scan_match_pose_(1), scan_match_pose_(2)),
+          msg.header.stamp);
+        push_capped(scan_errors_, error_to_truth(scan_match_pose_(0), scan_match_pose_(1)), kMaxErrors);
+      } else {
+        RCLCPP_WARN(
+          get_logger(), "REJECTED match: %s, delta=[%.3f, %.3f, %.3f], fitness=%.2f",
+          reason.c_str(), d(0), d(1), d(2), r.fitness);
+      }
+    }
+    last_scan_time_ = current_time;
   }
 
   void broadcast_odom_tf(const Odometry & msg)
@@ -302,18 +375,24 @@ private:
         return *std::max_element(e.begin(), e.end());
       };
 
-    // Same 13-value layout as ekf_node.py; scan_rms and scan_success_rate stay 0 (no ICP).
-    std_msgs::msg::Float64MultiArray msg;
+    const double scan_rms = scan_errors_.size() > 10 ? rms(scan_errors_) : 0.0;
+    const double scan_rate =
+      scan_match_count_ > 0 ? 100.0 * scan_match_success_count_ / scan_match_count_ : 0.0;
+
+    std_msgs::msg::Float64MultiArray msg;  // same 13-value layout as ekf_node.py
     msg.data = {
       ekf_rms, max_of(ekf_errors_), ekf_errors_.back(),
       ukf_rms, max_of(ukf_errors_), ukf_errors_.back(),
       dr_rms, max_of(dr_errors_), dr_errors_.back(),
-      ekf_imp, ukf_imp, 0.0, 0.0};
+      ekf_imp, ukf_imp, scan_rms, scan_rate};
     metrics_pub_->publish(msg);
 
+    const std::string scan_status =
+      enable_scan_matching_ ? "Scan: " + std::to_string(std::lround(scan_rate)) + "%" : "Scan: OFF";
     RCLCPP_INFO(
-      get_logger(), "%s | Scan: OFF | EKF: %.3fm | UKF: %.3fm | DR: %.3fm | Imp: %.1f%%",
-      in_gps_outage_ ? "GPS: OUT" : "GPS: OK", ekf_rms, ukf_rms, dr_rms, ekf_imp);
+      get_logger(), "%s | %s | EKF: %.3fm | UKF: %.3fm | DR: %.3fm | Imp: %.1f%%",
+      in_gps_outage_ ? "GPS: OUT" : "GPS: OK", scan_status.c_str(), ekf_rms, ukf_rms, dr_rms,
+      ekf_imp);
   }
 
   const double gps_rate_;
@@ -322,10 +401,16 @@ private:
   const double gps_outage_start_;
   const double gps_outage_duration_;
   const bool enable_gps_outage_;
+  const bool enable_scan_matching_;
+  const double scan_match_min_interval_;
   const double gps_period_;
 
   ekf_localization_cpp::EKF ekf_;
   ekf_localization_cpp::UKF ukf_;
+  ekf_localization_cpp::ScanMatcher scan_matcher_;  // Python's ctor args equal the defaults
+  Eigen::Vector3d scan_match_pose_ = Eigen::Vector3d::Zero();
+  std::optional<double> last_scan_time_;
+  int scan_match_count_ = 0, scan_match_success_count_ = 0;
   Eigen::Vector3d dr_state_ = Eigen::Vector3d::Zero();
   Eigen::Vector2d ground_truth_pos_ = Eigen::Vector2d::Zero();
 
@@ -335,17 +420,19 @@ private:
   std::mt19937 rng_;
   std::normal_distribution<double> normal_;
 
-  Path ekf_path_, ukf_path_, odom_path_, dr_path_;
-  std::vector<double> ekf_errors_, ukf_errors_, dr_errors_;
+  Path ekf_path_, ukf_path_, odom_path_, dr_path_, scan_path_;
+  std::vector<double> ekf_errors_, ukf_errors_, dr_errors_, scan_errors_;
 
   std::unique_ptr<tf2_ros::TransformBroadcaster> tf_broadcaster_;
   rclcpp::Publisher<PoseStamped>::SharedPtr pose_pub_;
-  rclcpp::Publisher<Path>::SharedPtr ekf_path_pub_, ukf_path_pub_, odom_path_pub_, dr_path_pub_;
+  rclcpp::Publisher<Path>::SharedPtr ekf_path_pub_, ukf_path_pub_, odom_path_pub_, dr_path_pub_,
+    scan_path_pub_;
   rclcpp::Publisher<Marker>::SharedPtr cov_marker_pub_;
   rclcpp::Publisher<std_msgs::msg::Float64MultiArray>::SharedPtr metrics_pub_;
   rclcpp::TimerBase::SharedPtr metrics_timer_;
   rclcpp::Subscription<Odometry>::SharedPtr odom_sub_;
   rclcpp::Subscription<sensor_msgs::msg::Imu>::SharedPtr imu_sub_;
+  rclcpp::Subscription<sensor_msgs::msg::LaserScan>::SharedPtr scan_sub_;
 };
 
 int main(int argc, char ** argv)

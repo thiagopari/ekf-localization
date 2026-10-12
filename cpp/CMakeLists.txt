@@ -15,6 +15,8 @@ find_package(sensor_msgs REQUIRED)
 find_package(std_msgs REQUIRED)
 find_package(tf2_ros REQUIRED)
 find_package(visualization_msgs REQUIRED)
+set(CMAKE_POLICY_DEFAULT_CMP0144 NEW)  # silences PCL 1.14's FindFLANN dev warning
+find_package(PCL REQUIRED COMPONENTS common kdtree)
 
 # ROS-free filter core: Eigen only.
 add_library(ekf_filters src/ekf.cpp src/ukf.cpp)
@@ -24,8 +26,15 @@ target_include_directories(ekf_filters PUBLIC
   $<INSTALL_INTERFACE:include>)
 target_link_libraries(ekf_filters PUBLIC Eigen3::Eigen)
 
+# ICP scan matcher; PCL stays private (not in the header).
+add_library(scan_matcher src/scan_matcher.cpp)
+target_include_directories(scan_matcher PUBLIC
+  $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>)
+target_include_directories(scan_matcher SYSTEM PRIVATE ${PCL_INCLUDE_DIRS})
+target_link_libraries(scan_matcher PUBLIC Eigen3::Eigen PRIVATE ${PCL_LIBRARIES})
+
 add_executable(ekf_node src/ekf_node.cpp)
-target_link_libraries(ekf_node ekf_filters rclcpp::rclcpp tf2_ros::tf2_ros
+target_link_libraries(ekf_node ekf_filters scan_matcher rclcpp::rclcpp tf2_ros::tf2_ros
   ${geometry_msgs_TARGETS} ${nav_msgs_TARGETS} ${sensor_msgs_TARGETS}
   ${std_msgs_TARGETS} ${visualization_msgs_TARGETS})
 
@@ -41,6 +50,9 @@ if(BUILD_TESTING)
 
   ament_add_gtest(test_filters test/test_filters.cpp)
   target_link_libraries(test_filters ekf_filters)
+
+  ament_add_gtest(test_scan_matcher test/test_scan_matcher.cpp)
+  target_link_libraries(test_scan_matcher scan_matcher)
 
   # Golden equivalence: the ORIGINAL ekf.py / ukf.py write the CSV, then C++ replays it.
   set(GOLDEN_CSV ${CMAKE_CURRENT_BINARY_DIR}/golden.csv)

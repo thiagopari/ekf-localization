@@ -13,6 +13,8 @@ ARGS = {
     'enable_gps_outage': 'false',
     'gps_outage_start': '30.0',
     'gps_outage_duration': '15.0',
+    'enable_scan_matching': 'true',
+    'scan_match_min_interval': '0.1',
 }
 
 
