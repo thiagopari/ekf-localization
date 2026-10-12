@@ -90,6 +90,8 @@ public:
     enable_gps_outage_(declare_parameter("enable_gps_outage", false)),
     enable_scan_matching_(declare_parameter("enable_scan_matching", true)),
     scan_match_min_interval_(declare_parameter("scan_match_min_interval", 0.1)),
+    // Not in ekf_node.py (hard-coded 0.3 m there); lets A/B runs take all noise from a bag.
+    gps_noise_std_(declare_parameter("gps_noise_std", 0.3)),
     gps_period_(1.0 / gps_rate_),
     rng_(std::random_device{}())
   {
@@ -187,10 +189,10 @@ private:
     }
 
     if (gps_available && current_time - *last_gps_time_ >= gps_period_) {
-      // Simulated GPS: ground-truth odom position + 0.3 m noise
+      // Simulated GPS: ground-truth odom position + gps_noise_std (0.3 m) noise
       const Eigen::Vector2d z(
-        msg.pose.pose.position.x + 0.3 * normal_(rng_),
-        msg.pose.pose.position.y + 0.3 * normal_(rng_));
+        msg.pose.pose.position.x + gps_noise_std_ * normal_(rng_),
+        msg.pose.pose.position.y + gps_noise_std_ * normal_(rng_));
       ekf_.update_gps(z);
       ukf_.update_gps(z);
       last_gps_time_ = current_time;
@@ -403,6 +405,7 @@ private:
   const bool enable_gps_outage_;
   const bool enable_scan_matching_;
   const double scan_match_min_interval_;
+  const double gps_noise_std_;
   const double gps_period_;
 
   ekf_localization_cpp::EKF ekf_;
